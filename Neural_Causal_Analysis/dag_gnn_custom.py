@@ -14,9 +14,6 @@ pip install bnlearn
 
 import bnlearn as bn
 
-
-#Custom DAG_GNN 정의
-
 class Generalized_DAG_GNN(tf.keras.Model):
   def __init__(self, input_dim,lat_dim,h=[20,20]):
     super(Generalized_DAG_GNN,self).__init__()
@@ -25,11 +22,13 @@ class Generalized_DAG_GNN(tf.keras.Model):
     self.h1 = h[0]*lat_dim
     self.h2 = h[1]*lat_dim
 
+    #X = f(A^T X)
 
     mat1 = np.zeros(self.input_dim*self.h1).reshape(self.input_dim,self.h1)
     mat2 = np.zeros(self.h1*self.h2).reshape(self.h1,self.h2)
     mat3 = np.zeros(self.h2*self.lat_dim).reshape(self.h2,self.lat_dim)
     mat4 = np.ones(self.lat_dim*self.lat_dim).reshape(self.lat_dim,self.lat_dim)
+    mat5 = np.zeros(self.lat_dim*(self.lat_dim+self.lat_dim)).reshape(self.lat_dim,self.lat_dim+self.lat_dim)
     for i in range(self.lat_dim):
       mat1[i,(i*h[0]):((i+1)*h[0])] = 1
     for i in range(self.lat_dim):
@@ -38,6 +37,9 @@ class Generalized_DAG_GNN(tf.keras.Model):
       mat3[(i*h[1]):((i+1)*h[1]),i] = 1
     for i in range(self.lat_dim):
       mat4[i,i] = 0
+    for i in range(self.lat_dim):
+      mat5[i,i]= 1
+      mat5[i,i+self.lat_dim] = 1
 
     class mask_1(tf.keras.constraints.Constraint):
       def __call__(self,w):
@@ -54,6 +56,10 @@ class Generalized_DAG_GNN(tf.keras.Model):
     class mask_4(tf.keras.constraints.Constraint):
       def __call__(self,w):
         return mat4*w
+
+    class mask_5(tf.keras.constraints.Constraint):
+      def __call__(self,w):
+        return mat5*w
 
 
     self.ADJ = self.add_weight(shape=(self.lat_dim,self.lat_dim),trainable=True,name="adj",initializer="zeros",constraint=mask_4())
@@ -74,7 +80,7 @@ class Generalized_DAG_GNN(tf.keras.Model):
 
     self.Enc_v1 = Sequential([
       InputLayer(shape=(self.lat_dim,)),
-      Dense(self.lat_dim+self.lat_dim, activation="linear",use_bias=False)
+      Dense(self.lat_dim+self.lat_dim, activation="linear",use_bias=False,kernel_constraint=mask_5())
     ])
 
   def reparam(self,x):
@@ -129,24 +135,25 @@ dgn.mse_loss_(np.array([[1,2,4,2,1],[1,3,2,1,2]]))
 dgn.trainable_variables[0]
 
 
-#Importing causal data
+#Causal DATA
 np.random.seed(321)
 dg = bn.import_DAG("sprinkler")
 df = bn.sampling(dg, n=200)
 
+#dg
 
 true_dag = bn.dag2adjmat(dg['model'])*1
 
-#Ground Truth causal DAG
 true_dag
 
 
-#Training
+
+#Custom DAG_GNN Training
 
 tf.keras.utils.set_random_seed(678)
 
 
-Epochs = 500
+Epochs = 400
 lat_dim_ = 4
 G_D = Generalized_DAG_GNN(lat_dim_,lat_dim_,[6,6])
 
@@ -161,23 +168,20 @@ lamb = 1.0 #L1-regularization
 loss_ms = []
 loss_t = []
 basic_opt = tf.keras.optimizers.Adam(learning_rate=0.01)
-basic_opt2 = tf.keras.optimizers.Adam(learning_rate=0.005)
-basic_opt3 = tf.keras.optimizers.Adam(learning_rate=0.005)
+basic_opt2 = tf.keras.optimizers.Adam(learning_rate=0.003)
 mse = tf.keras.losses.MeanSquaredError()
 
 while i < Epochs:
-    with tf.GradientTape() as dv_1, tf.GradientTape() as dv_2, tf.GradientTape() as dv_3:
+    with tf.GradientTape() as dv_1, tf.GradientTape() as dv_2:   #, tf.GradientTape() as dv_3:
       loss_1 = G_D.mse_loss_(df)
       h_a = tf.linalg.trace(tf.linalg.expm(tf.math.multiply(G_D.weights[0], G_D.weights[0])))-lat_dim_
       total_loss = loss_1 + alpha*h_a+rho*0.5*tf.math.abs(h_a)**2+lamb*tf.norm(G_D.weights[0], ord=1, axis=[-2,-1])
     loss_ms.append(loss_1)
     loss_t.append(total_loss)
     grad_1 = dv_1.gradient(total_loss, [G_D.trainable_variables[0]])
-    grad_2 = dv_2.gradient(total_loss, G_D.ENCODER.trainable_variables)
-    grad_3 = dv_3.gradient(total_loss, G_D.DECODER.trainable_variables)
+    grad_2 = dv_2.gradient(total_loss, G_D.trainable_variables[1:])
     basic_opt.apply_gradients(zip(grad_1, [G_D.trainable_variables[0]]))
-    basic_opt2.apply_gradients(zip(grad_2, G_D.ENCODER.trainable_variables))
-    basic_opt3.apply_gradients(zip(grad_3, G_D.DECODER.trainable_variables))
+    basic_opt2.apply_gradients(zip(grad_2, G_D.trainable_variables[1:]))
 
     h_a_new = tf.linalg.trace(tf.linalg.expm(tf.math.multiply(G_D.weights[0], G_D.weights[0])))-lat_dim_
     alpha =  alpha + rho * h_a_new
@@ -200,25 +204,23 @@ np.array(G_D.weights[0])
 np.mean(np.abs(np.array(G_D.weights[0])))
 np.quantile(np.abs(np.array(G_D.weights[0])),0.7)
 
-#Binarized adjacency matrix
-sns.heatmap(np.where(np.abs(np.array(G_D.weights[0]))>np.quantile(np.abs(np.array(G_D.weights[0])),0.75),1,0), cmap="gray_r",linewidths=1,linecolor="black")
+sns.heatmap(np.where(np.abs(np.array(G_D.weights[0]))>np.quantile(np.abs(np.array(G_D.weights[0])),0.7),1,0), cmap="gray_r",linewidths=1,linecolor="black")
 plt.show()
 
 sns.heatmap(true_dag, cmap="gray_r",linewidths=1, linecolor="black")
 
 
-#Hill climbing algorithm과의 비교
-model_hc = bn.structure_learning.fit(df, methodtype='hc',scoretype='bic')
+#Traditional DAG search example: exhaustive search
+model_hc = bn.structure_learning.fit(df, methodtype='ex',scoretype='k2')
 
-model_hc['adjmat']*1
+a1 = model_hc['adjmat']
+a1 = a1.reindex(index=['Cloudy','Sprinkler','Rain','Wet_Grass'],columns=['Cloudy','Sprinkler','Rain','Wet_Grass'])*1
 
-sns.heatmap(model_hc['adjmat']*1,cmap="gray_r",linewidths=1,linecolor="black")
+sns.heatmap(a1,cmap="gray_r",linewidths=1,linecolor="black")
 
 sns.heatmap(true_dag,cmap="gray_r",linewidths=1,linecolor="black")
 
+shd1 = np.sum(np.sum(np.abs(a1-true_dag)));shd1
 
-#Structural Hamming Distance(SHD)
-shd1 = np.sum(np.sum(np.abs(model_hc['adjmat']*1-true_dag)));shd1
-
-shd2 = np.sum(np.sum(np.abs(np.where(np.abs(np.array(G_D.weights[0]))>np.quantile(np.abs(np.array(G_D.weights[0])),0.75),1,0)-true_dag)));shd2
+shd2 = np.sum(np.sum(np.abs(np.where(np.abs(np.array(G_D.weights[0]))>np.quantile(np.abs(np.array(G_D.weights[0])),0.7),1,0)-true_dag)));shd2
 
